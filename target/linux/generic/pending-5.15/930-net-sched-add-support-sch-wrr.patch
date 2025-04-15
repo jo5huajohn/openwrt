@@ -1,0 +1,240 @@
+--- /dev/null
++++ b/net/sched/sch_wrr.c
+@@ -0,0 +1,203 @@
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/skbuff.h>
++#include <linux/skb_array.h>
++#include <linux/types.h>
++#include <net/pkt_sched.h>
++
++#define WRR_BANDS	3
++
++struct wrr_sched_data {
++	struct skb_array q[WRR_BANDS];
++};
++
++static const u8 prio2band[TC_PRIO_MAX + 1] = {
++	1, 2, 2, 2, 1, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1
++};
++
++static inline struct skb_array *band2list(struct wrr_sched_data *priv, int band)
++{
++	return &priv->q[band];
++}
++
++static int wrr_enqueue(struct sk_buff *skb, struct Qdisc *qdisc,
++		       struct sk_buff **to_free)
++{
++	int band = prio2band[skb->priority & TC_PRIO_MAX];
++	struct wrr_sched_data *priv = qdisc_priv(qdisc);
++	struct skb_array *q = band2list(priv, band);
++	unsigned int pkt_len = qdisc_pkt_len(skb);
++	int err;
++
++	err = skb_array_produce(q, skb);
++
++	if (unlikely(err)) {
++		if (qdisc_is_percpu_stats(qdisc))
++			return qdisc_drop_cpu(skb, qdisc, to_free);
++		else
++			return qdisc_drop(skb, qdisc, to_free);
++	}
++
++	qdisc_update_stats_at_enqueue(qdisc, pkt_len);
++	return NET_XMIT_SUCCESS;
++}
++
++static struct sk_buff *wrr_dequeue(struct Qdisc *qdisc)
++{
++	struct wrr_sched_data *priv = qdisc_priv(qdisc);
++	struct sk_buff *skb = NULL;
++	int band;
++	bool need_retry = true;
++
++retry:
++	for (band = 0; band < WRR_BANDS && !skb; band++) {
++		struct skb_array *q = band2list(priv, band);
++
++		if (__skb_array_empty(q))
++			continue;
++
++		for (int pkt = 0; pkt < (WRR_BANDS - band); pkt++) {
++			skb = __skb_array_consume(q);
++
++			if (__skb_array_empty(q))
++				break;
++		}
++	}
++	if (likely(skb)) {
++		qdisc_update_stats_at_dequeue(qdisc, skb);
++	} else if (need_retry &&
++		   READ_ONCE(qdisc->state) & QDISC_STATE_NON_EMPTY) {
++		clear_bit(__QDISC_STATE_MISSED, &qdisc->state);
++		clear_bit(__QDISC_STATE_DRAINING, &qdisc->state);
++
++		smp_mb__after_atomic();
++
++		need_retry = false;
++
++		goto retry;
++	}
++
++	return skb;
++}
++
++static void wrr_reset(struct Qdisc *qdisc)
++{
++	int i, band;
++	struct wrr_sched_data *priv = qdisc_priv(qdisc);
++
++	for (band = 0; band < WRR_BANDS; band++) {
++		struct skb_array *q = band2list(priv, band);
++		struct sk_buff *skb;
++
++		if (!q->ring.queue)
++			continue;
++
++		while ((skb = __skb_array_consume(q)) != NULL)
++			kfree_skb(skb);
++	}
++
++	if (qdisc_is_percpu_stats(qdisc)) {
++		for_each_possible_cpu(i) {
++			struct gnet_stats_queue *q;
++
++			q = per_cpu_ptr(qdisc->cpu_qstats, i);
++			q->backlog = 0;
++			q->qlen = 0;
++		}
++	}
++}
++
++static int wrr_dump(struct Qdisc *qdisc, struct sk_buff *skb)
++{
++	struct tc_prio_qopt opt = {.bands = WRR_BANDS };
++
++	memcpy(&opt.priomap, prio2band, TC_PRIO_MAX + 1);
++	if (nla_put(skb, TCA_OPTIONS, sizeof(opt), &opt))
++		goto nla_put_failure;
++	return skb->len;
++
++nla_put_failure:
++	return -1;
++}
++
++static int wrr_init(struct Qdisc *qdisc, struct nlattr *opt,
++		    struct netlink_ext_ack *extack)
++{
++	unsigned int qlen = qdisc_dev(qdisc)->tx_queue_len;
++	struct wrr_sched_data *priv = qdisc_priv(qdisc);
++	int prio;
++
++	if (!qlen)
++		return -EINVAL;
++
++	for (prio = 0; prio < WRR_BANDS; prio++) {
++		struct skb_array *q = band2list(priv, prio);
++
++		int err = skb_array_init(q, qlen, GFP_KERNEL);;
++		if (err)
++			return -ENOMEM;
++	}
++
++	qdisc->flags |= TCQ_F_CAN_BYPASS;
++	return 0;
++}
++
++static void wrr_destroy(struct Qdisc *qdisc)
++{
++	struct wrr_sched_data *priv = qdisc_priv(qdisc);
++	int prio;
++
++	for (prio = 0; prio < WRR_BANDS; prio++) {
++		struct skb_array *q = band2list(priv, prio);
++
++		if (!q->ring.queue)
++			continue;
++
++		ptr_ring_cleanup(&q->ring, NULL);
++	}
++}
++
++static struct sk_buff *wrr_peek(struct Qdisc *qdisc)
++{
++	struct wrr_sched_data *priv = qdisc_priv(qdisc);
++	struct sk_buff *skb = NULL;
++	int band;
++
++	for (band = 0; band < WRR_BANDS && !skb; band++) {
++		struct skb_array *q = band2list(priv, band);
++
++		skb = __skb_array_peek(q);
++	}
++
++	return skb;
++}
++
++struct Qdisc_ops wrr_qdisc_ops __read_mostly = {
++	.id		=	"wrr",
++	.priv_size	=	sizeof(struct wrr_sched_data),
++	.enqueue	=	wrr_enqueue,
++	.dequeue	=	wrr_dequeue,
++	.peek		=	wrr_peek,
++	.init		=	wrr_init,
++	.destroy	=	wrr_destroy,
++	.reset		=	wrr_reset,
++	.change		=	wrr_init,
++	.dump		=	wrr_dump,
++	.owner		=	THIS_MODULE,
++	.static_flags	=	TCQ_F_NOLOCK | TCQ_F_CPUSTATS
++};
++EXPORT_SYMBOL(wrr_qdisc_ops);
++
++static int __init wrr_module_init(void)
++{
++	return register_qdisc(&wrr_qdisc_ops);
++}
++
++static void __exit wrr_module_exit(void)
++{
++	unregister_qdisc(&wrr_qdisc_ops);
++}
++
++module_init(wrr_module_init)
++module_exit(wrr_module_exit)
++MODULE_LICENSE("GPL");
+--- a/net/sched/Makefile
++++ b/net/sched/Makefile
+@@ -62,6 +62,7 @@ obj-$(CONFIG_NET_SCH_FQ_PIE)	+= sch_fq_p
+ obj-$(CONFIG_NET_SCH_CBS)	+= sch_cbs.o
+ obj-$(CONFIG_NET_SCH_ETF)	+= sch_etf.o
+ obj-$(CONFIG_NET_SCH_TAPRIO)	+= sch_taprio.o
++obj-$(CONFIG_NET_SCH_WRR)	+= sch_wrr.o
+ 
+ obj-$(CONFIG_NET_CLS_U32)	+= cls_u32.o
+ obj-$(CONFIG_NET_CLS_ROUTE4)	+= cls_route.o
+--- a/net/sched/Kconfig
++++ b/net/sched/Kconfig
+@@ -397,6 +397,21 @@ config NET_SCH_ETS
+ 
+ 	  If unsure, say N.
+ 
++config NET_SCH_WRR
++	tristate "Weighted round-robin scheduler (WRR)"
++	help
++	  The weighted round robin scheduler is a classless
++	  queuing discipline that assigns weights to separate
++	  queues.
++
++	  Say Y here if you want to use the WRR packet scheduling
++	  algorithm
++
++	  To compile this driver as a module, choose M here: the module
++	  will be call sch_wrr.
++
++	  If unsure, say N.
++
+ menuconfig NET_SCH_DEFAULT
+ 	bool "Allow override default queue discipline"
+ 	help
