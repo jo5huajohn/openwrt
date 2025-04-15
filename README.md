@@ -6,7 +6,7 @@ The network scheduler contains three queues and uses the priority field in the s
 - Run `make kernel_menuconfig`
 - Enable the WRR scheduler under Networking support/Networking options/QoS and/or fair queueing/Weighted round-robin scheduler (WRR)
 - Save the config and compile OpenWrt for your device
-- Use tc to change the networking scheduler (Requires the tc-full package to be enabled)
+- Use `tc` to change the networking scheduler (Requires the tc-full package to be enabled)
 
 > [!NOTE]
 > This scheduler was built for learning purposes and is not meant to be used for serious tasks. If you choose to do so, you do it at your own risk.
